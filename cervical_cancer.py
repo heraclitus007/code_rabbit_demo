@@ -102,22 +102,8 @@ def fill_missing(df: pd.DataFrame) -> pd.DataFrame:
 # 2. Feature Engineering
 # ---------------------------------------------------------------------------
 
-def make_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
+def make_preprocessor(num_cols: list[str], cat_cols: list[str]) -> ColumnTransformer:
     """Build ColumnTransformer: scale numeric, one‑hot encode binaries."""
-    num_cols = df.select_dtypes(include=[np.number]).columns.drop(TARGET_COL)
-    cat_cols = [
-        "Smokes",
-        "Hormonal Contraceptives",
-        "IUD",
-        "STDs",
-        "Dx:Cancer",
-        "Dx:CIN",
-        "Dx:HPV",
-        "Dx",
-        "Hinselmann",
-        "Citology",
-        "Schiller",
-    ]
     return ColumnTransformer(
         [
             ("num", StandardScaler(), num_cols),
@@ -125,12 +111,6 @@ def make_preprocessor(df: pd.DataFrame) -> ColumnTransformer:
         ],
         remainder="drop",
     )
-
-
-def balance_data(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Apply hybrid sampling to tackle class imbalance."""
-    sampler = SMOTETomek(random_state=RANDOM_STATE)
-    return sampler.fit_resample(X, y)
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +128,7 @@ def recursive_feature_elim(estimator, X, y, cv=5) -> list[int]:
 # ---------------------------------------------------------------------------
 
 METRICS = {
-    "accuracy": accuracy_score,
+    "accuracy_score": accuracy_score,
     "precision": precision_score,
     "recall": recall_score,
     "f1": f1_score,
@@ -169,24 +149,44 @@ def evaluate(model, X, y, cv=5) -> dict[str, float]:
 # 5. Main pipeline
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main(fig_size=(10, 5), tight_layout=True) -> None:
     # Load & preprocess
-    df = fill_missing(load_data(DATA_PATH))
-
+    df = load_data(DATA_PATH)
+    
+    # Validate required columns
+    required_columns = [
+    num_cols = df.select_dtypes(include=[np.number]).columns.drop(TARGET_COL).tolist()
+    cat_cols = [
+        "Smokes",
+        "Hormonal Contraceptives",
+        "IUD",
+        "STDs",
+        "Dx:Cancer",
+        "Dx:CIN",
+        "Dx:HPV",
+        "Dx",
+        "Hinselmann",
+        "Citology",
+        "Schiller",
+    ]
+    preprocessor = make_preprocessor(num_cols, cat_cols)
+        "Smokes (years)", "Smokes (packs/year)", "Hormonal Contraceptives (years)",
+        "IUD (years)", "STDs (number)", "STDs:condylomatosis", "STDs:cervical condylomatosis",
+        "STDs:vaginal condylomatosis", "STDs:vulvo-perineal condylomatosis", "STDs:syphilis",
+        "STDs:pelvic inflammatory disease", "STDs:genital herpes", "STDs:molluscum contagiosum",
+        "STDs:AIDS", "STDs:HIV", "STDs:Hepatitis B", "STDs:HPV", "STDs: Time since first diagnosis",
+        "STDs: Time since last diagnosis", "Smokes", "Hormonal Contraceptives", "IUD", "STDs"
+    ]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns in the dataset: {missing_columns}")
+    
+    df = fill_missing(df)
     X = df.drop(columns=[TARGET_COL])
     y = df[TARGET_COL].astype(int)
 
     preprocessor = make_preprocessor(df)
-    X_proc = preprocessor.fit_transform(X)
 
-    X_bal, y_bal = balance_data(X_proc, y)
-
-    # Choose a subset of informative features using RFECV + RandomForest
-    sel_idx = recursive_feature_elim(RandomForestClassifier(random_state=RANDOM_STATE),
-                                     X_bal, y_bal)
-    X_sel = X_bal[:, sel_idx]
-
-    # Model list
     MODELS = [
         ("LogReg", LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)),
         ("RandomForest", RandomForestClassifier(random_state=RANDOM_STATE)),
@@ -197,19 +197,26 @@ def main() -> None:
     ]
 
     results = []
-    for name, model in MODELS:
-        print(f"\nTraining {name} …")
-        model.fit(X_sel, y_bal)
-        res = evaluate(model, X_sel, y_bal)
-        res.update({"model": name})
-        results.append(res)
+    for name, clf in MODELS:
+        print(f"\nEvaluating {name} with cross-validation (no leakage) …")
+        pipe = Pipeline([
+            ("preprocess", preprocessor),
+            ("balance", SMOTETomek(random_state=RANDOM_STATE)),
+            ("clf", clf),
+        ])
+        cv_results = cross_validate(pipe, X, y, cv=5, scoring=METRICS, n_jobs=-1)
+        scores = {metric: np.mean(cv_results[f'test_{metric}']) for metric in METRICS}
+        scores["model"] = name
+        results.append(scores)
 
-    # Results dataframe
     res_df = pd.DataFrame(results).set_index("model").sort_values("roc_auc", ascending=False)
-    print("\n=== CV metric means (after feature selection & balancing) ===")
-    print(res_df.round(3))
-
-    # Plot
+    print("\n=== CV metric means (pipeline, no leakage) ===")
+    res_df = pd.DataFrame(results).set_index("model")
+    if "roc_auc" not in res_df.columns:
+    res_df[["accuracy", "roc_auc", "f1"]].plot(kind="barh", figsize=fig_size)
+    plt.title("Model comparison")
+    if tight_layout:
+        plt.tight_layout()
     res_df[["accuracy", "roc_auc", "f1"]].plot(kind="barh", figsize=(10, 5))
     plt.title("Model comparison")
     plt.tight_layout()
